@@ -26,16 +26,22 @@ import re
 import numpy as np
 import pandas as pd
 
-NUMERIC_COLS = ["temp_c", "heart_rate", "ambient_temp", "lat", "lon"]
+NUMERIC_COLS = ["neck_temp", "heart_rate", "region_temp", "lat", "lon"]
 CATEGORICAL_COLS = ["activity"]
+
+# Fixed activity categories for the target schema -- one-hot output must
+# always have exactly these 4 columns, even if a given week never contains
+# one of them (e.g. an animal that never "Ruminating"s that week still
+# needs a Ruminating column of all 0s, not a missing column).
+ACTIVITY_CATEGORIES = ["Standing", "Walking", "Eating", "Ruminating"]
 
 RAW_COLUMN_MAP = {
     "Date": "date",
     "Time": "time",
-    "Temp (°C)": "temp_c",
-    "Temp (Â°C)": "temp_c",   # guard against mojibake if file isn't utf-8
+    "Temp (°C)": "neck_temp",
+    "Temp (Â°C)": "neck_temp",   # guard against mojibake if file isn't utf-8
     "Heart Rate": "heart_rate",
-    "Ambient Temp": "ambient_temp",
+    "Ambient Temp": "region_temp",
     "Activity": "activity",
     "Location(0.000000, 0.000000)": "location",
     "Location": "location",
@@ -84,7 +90,7 @@ def load_raw(df_raw: pd.DataFrame) -> pd.DataFrame:
         df["lat"] = lat_lon.apply(lambda t: t[0])
         df["lon"] = lat_lon.apply(lambda t: t[1])
 
-    for col in ["temp_c", "heart_rate", "ambient_temp"]:
+    for col in ["neck_temp", "heart_rate", "region_temp"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 

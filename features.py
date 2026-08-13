@@ -1,64 +1,76 @@
 """
 features.py
 ------------
-Turns the clean, humidity-enriched hourly dataset into a model-ready
+Turns the clean, humidity-enriched hourly dataset into the target model
 feature table:
 
-1. heat_index_c: combines ambient_temp + humidity into a single
-   "feels like" temperature using the NOAA/Rothfusz regression
-   (industry-standard heat index formula).
-2. One-hot encoding of the `activity` column.
-3. Cyclical (sin/cos) encoding of time -- hour-of-day and day-of-week --
-   so a model sees 23:00 and 00:00 as adjacent instead of far apart.
+  region_temperature_C, THI, heart_rate_bpm, Standing, Walking, Eating,
+  Ruminating, neck_temperature_C, hour_sin, hour_cos, day_sin, day_cos
+
+1. THI: livestock Temperature-Humidity Index (NRC 1971 formula), computed
+   from region_temp + humidity. This replaces a generic "feels like"
+   heat-index -- THI is the standard metric used in dairy/livestock heat
+   stress monitoring, which is what this schema is for.
+2. One-hot encoding of `activity` into 4 FIXED columns (Standing, Walking,
+   Eating, Ruminating) -- fixed, not data-driven, so the output schema
+   never changes shape even if one category is absent from a given week.
+3. Cyclical (sin/cos) encoding of hour-of-day (24-cycle) AND day-of-year
+   (365/366-cycle, NOT day-of-week). Verified against the target sample
+   file: day_sin/day_cos there resolve to 365 distinct values, not 7.
 """
 
+from processing import ACTIVITY_CATEGORIES
 import numpy as np
 import pandas as pd
 
+FINAL_COLUMNS = [
+    "region_temperature_C",
+    "THI",
+    "heart_rate_bpm",
+    "Standing",
+    "Walking",
+    "Eating",
+    "Ruminating",
+    "neck_temperature_C",
+    "hour_sin",
+    "hour_cos",
+    "day_sin",
+    "day_cos",
+]
 
-def compute_heat_index(temp_c: pd.Series, humidity_pct: pd.Series) -> pd.Series:
+
+def compute_thi(temp_c: pd.Series, humidity_pct: pd.Series) -> pd.Series:
     """
-    NOAA heat index (Rothfusz regression). Formula is defined in °F, so we
-    convert in and back out. Only meaningful above ~27°C / 80°F and with
-    humidity >= 40%; below that we just return the ambient temp unchanged,
-    which is what NOAA's own guidance recommends (the regression is not
-    valid outside that range and produces nonsense numbers there).
+    NRC (1971) livestock Temperature-Humidity Index:
+        THI = (1.8*T + 32) - (0.55 - 0.0055*RH) * (1.8*T - 26)
+    where T is dry-bulb air temp in °C and RH is relative humidity in %.
+    This is the standard THI used in dairy heat-stress monitoring
+    (values >= 68 indicate onset of heat stress, >= 80 severe stress).
     """
-    temp_f = temp_c * 9 / 5 + 32
-    rh = humidity_pct
-
-    hi_simple = 0.5 * (temp_f + 61.0 + (temp_f - 68.0) * 1.2 + rh * 0.094)
-    avg_f = (temp_f + hi_simple) / 2
-
-    hi_full = (
-        -42.379
-        + 2.04901523 * temp_f
-        + 10.14333127 * rh
-        - 0.22475541 * temp_f * rh
-        - 0.00683783 * temp_f ** 2
-        - 0.05481717 * rh ** 2
-        + 0.00122874 * temp_f ** 2 * rh
-        + 0.00085282 * temp_f * rh ** 2
-        - 0.00000199 * temp_f ** 2 * rh ** 2
-    )
-
-    use_full = avg_f >= 80
-    heat_index_f = np.where(use_full, hi_full, temp_f)
-    heat_index_c = (heat_index_f - 32) * 5 / 9
-    return pd.Series(heat_index_c, index=temp_c.index)
+    t_f = 1.8 * temp_c + 32
+    return t_f - (0.55 - 0.0055 * humidity_pct) * (t_f - 26)
 
 
-def add_heat_index(df: pd.DataFrame) -> pd.DataFrame:
+def add_thi(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    if "ambient_temp" in df.columns and "humidity" in df.columns:
-        df["heat_index_c"] = compute_heat_index(df["ambient_temp"], df["humidity"])
+    if "region_temp" in df.columns and "humidity" in df.columns:
+        df["THI"] = compute_thi(df["region_temp"], df["humidity"])
     return df
 
 
 def one_hot_activity(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    One-hot encode `activity` into exactly ACTIVITY_CATEGORIES columns.
+    Uses pd.Categorical with a fixed category list so the output always
+    has all 4 columns (0-filled if a category never occurs), instead of
+    pd.get_dummies' default of only emitting columns that appear in data.
+    """
     df = df.copy()
     if "activity" in df.columns:
-        dummies = pd.get_dummies(df["activity"], prefix="activity")
+        cat = pd.Categorical(df["activity"], categories=ACTIVITY_CATEGORIES)
+        dummies = pd.get_dummies(cat)
+        dummies = dummies.reindex(columns=ACTIVITY_CATEGORIES, fill_value=False)
+        dummies.index = df.index
         df = pd.concat([df, dummies], axis=1)
     return df
 
@@ -71,15 +83,26 @@ def add_cyclical_time_features(df: pd.DataFrame) -> pd.DataFrame:
     df["hour_sin"] = np.sin(2 * np.pi * hour / 24)
     df["hour_cos"] = np.cos(2 * np.pi * hour / 24)
 
-    dow = dt.dt.dayofweek  # Monday=0
-    df["dow_sin"] = np.sin(2 * np.pi * dow / 7)
-    df["dow_cos"] = np.cos(2 * np.pi * dow / 7)
+    # Day-OF-YEAR cycle (not day-of-week) -- matches target schema.
+    # Use day + fractional hour for a smooth cycle across a 365.25-day year.
+    day_of_year = dt.dt.dayofyear + hour / 24.0
+    days_in_year = np.where(dt.dt.is_leap_year, 366, 365)
+    df["day_sin"] = np.sin(2 * np.pi * day_of_year / days_in_year)
+    df["day_cos"] = np.cos(2 * np.pi * day_of_year / days_in_year)
 
     return df
 
 
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
-    df = add_heat_index(df)
+    df = add_thi(df)
     df = one_hot_activity(df)
     df = add_cyclical_time_features(df)
-    return df
+
+    rename_map = {"region_temp": "region_temperature_C", "neck_temp": "neck_temperature_C", "heart_rate": "heart_rate_bpm"}
+    df = df.rename(columns=rename_map)
+
+    missing = [c for c in FINAL_COLUMNS if c not in df.columns]
+    if missing:
+        raise ValueError(f"Cannot build final schema, missing columns: {missing}")
+
+    return df[FINAL_COLUMNS]

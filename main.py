@@ -8,16 +8,18 @@ FastAPI service exposing one endpoint:
         {
           "fetch_weather": true,
           "readings": [
-            {"date": "2026-08-06", "time": "00:00:00", "temp_c": 36.96,
-             "heart_rate": 61, "ambient_temp": 24.3, "activity": "Walking",
+            {"date": "2026-08-06", "time": "00:00:00", "neck_temp": 36.96,
+             "heart_rate": 61, "region_temp": 24.3, "activity": "Walking",
              "location": "(28.474832, 77.504403)"},
             ...
           ]
         }
-      (irregular ~30-min intervals, any field except date/time may be null)
-    - Returns clean 7-day x 1-hour (168-row) feature table as JSON,
-      with humidity fetched per-location and heat index / one-hot /
-      cyclical time features attached.
+      (irregular ~30-min intervals, any field except date/time may be null.
+       activity must be one of: Standing, Walking, Eating, Ruminating)
+    - Returns clean 7-day x 1-hour (168-row) feature table as JSON, matching
+      the target schema: region_temperature_C, THI, heart_rate_bpm,
+      Standing, Walking, Eating, Ruminating, neck_temperature_C,
+      hour_sin, hour_cos, day_sin, day_cos
 
 Run locally:
     uvicorn main:app --reload --port 8000
@@ -41,10 +43,10 @@ app = FastAPI(title="Wearable Weekly Data Pipeline")
 class Reading(BaseModel):
     date: str                              # "2026-08-06"
     time: str                              # "00:00:00"
-    temp_c: Optional[float] = None
+    neck_temp: Optional[float] = None      # neck-collar sensor temp, °C
     heart_rate: Optional[float] = None
-    ambient_temp: Optional[float] = None
-    activity: Optional[str] = None
+    region_temp: Optional[float] = None    # regional/ambient temp, °C
+    activity: Optional[str] = None         # Standing | Walking | Eating | Ruminating
     location: Optional[str] = None         # "(lat, lon)" e.g. "(28.4748, 77.5040)"
 
 
@@ -73,9 +75,11 @@ async def process_week(payload: WeeklyDataRequest):
     if payload.fetch_weather:
         hourly = add_humidity(hourly)
 
-    featurized = build_features(hourly)
+    try:
+        featurized = build_features(hourly)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
 
-    featurized["datetime"] = featurized["datetime"].astype(str)
     records = featurized.to_dict(orient="records")
 
     return JSONResponse({
