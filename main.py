@@ -29,11 +29,15 @@ FastAPI service exposing ONE endpoint:
         3. Feed the 36 features into the trained Model 1 XGBoost model ->
            predicted_body_temp_C, one per hour.
         4. Append predicted_body_temp_C onto the 12-column data (13 cols
-           total) and return it. The 36-feature table and everything else
-           is discarded once the response is built -- no database, no
-           file on disk, nothing kept after the response is sent.
+           total).
+        5. Build 30 estrus-detection features (model2_features.py) from
+           that same 13-column data and append them (43 cols total) and
+           return it. The 36-feature Model 1 table, the 30-feature
+           Model 2 table, and everything else is discarded once the
+           response is built -- no database, no file on disk, nothing
+           kept after the response is sent.
 
-    - Response shape (168 rows, one per hour):
+    - Response shape (168 rows, one per hour, 43 columns each):
         {
           "rows": 168,
           "columns": [...],
@@ -51,7 +55,15 @@ FastAPI service exposing ONE endpoint:
               "hour_cos": 1.0,
               "day_sin": -0.5737722679043243,
               "day_cos": -0.8190148866680802,
-              "predicted_body_temp_C": 39.20598602294922
+              "predicted_body_temp_C": 39.20598602294922,
+              "body_temp_zscore_24h": 1.44,
+              "body_temp_zscore_6h": 1.44,
+              "body_temp_delta_6h": null,
+              "neck_temp_zscore_24h": -1.59,
+              "thermal_gradient_body_neck": 18.66,
+              "thi_adjusted_body_temp_residual": 0.81,
+              "cardiothermal_index": 807.86,
+              "...": "... (30 model2 features total, see model2_features.FEATURE_COLUMNS)"
             },
             ...
           ]
@@ -74,6 +86,7 @@ from weather import add_humidity
 from features import build_features
 from model1_features import build_model1_features
 from model1_predict import predict_body_temp
+from model2_features import build_model2_features
 
 app = FastAPI(title="Wearable Weekly Data Pipeline")
 
@@ -134,12 +147,30 @@ async def process_week(payload: WeeklyDataRequest):
     except (ValueError, FileNotFoundError) as e:
         raise HTTPException(status_code=500, detail=f"Prediction failed: {e}")
 
-    # Step 4: append prediction onto the 12-column data and return it.
-    # After this response is sent, base_12col / model1_feats / predictions
-    # are all garbage-collected -- nothing about this request is retained.
+    # Step 4: append prediction onto the 12-column data (13 columns).
     result_df = base_12col.copy()
     result_df["predicted_body_temp_C"] = predictions.values
 
+    # Step 5: build the 30 estrus-detection features from that 13-column
+    # table and append them too. Same in-memory, throwaway pattern as
+    # everything above -- nothing here is persisted.
+    try:
+        model2_feats = build_model2_features(result_df)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    result_df = pd.concat([result_df, model2_feats], axis=1)
+
+    # Several model2 features are structurally undefined for the first
+    # few hours of the window (e.g. body_temp_delta_6h needs t>=6,
+    # lag_24h_walking needs t>=24). Those show up as NaN, which Python's
+    # json module serializes as a bare `NaN` token -- not valid JSON.
+    # Convert to None so the response is strict-JSON-parseable (null).
+    result_df = result_df.astype(object).where(pd.notnull(result_df), None)
+
+    # After this response is sent, base_12col / model1_feats / predictions /
+    # model2_feats are all garbage-collected -- nothing about this request
+    # is retained.
     records = result_df.to_dict(orient="records")
     return JSONResponse({
         "rows": len(records),
