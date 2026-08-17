@@ -1,4 +1,0 @@
-request_id,saved_at_utc,rows,columns
-090e62e6-0666-4d1b-bf71-a2f1d10f256d,2026-08-14T05:31:26.401413,168,"region_temperature_C,THI,heart_rate_bpm,Standing,Walking,Eating,Ruminating,neck_temperature_C,hour_sin,hour_cos,day_sin,day_cos"
-cf1e5f93-391d-4bee-a49a-77a13ed96fa1,2026-08-14T05:33:34.663125,168,"region_temperature_C,THI,heart_rate_bpm,Standing,Walking,Eating,Ruminating,neck_temperature_C,hour_sin,hour_cos,day_sin,day_cos"
-cf1e5f93-391d-4bee-a49a-77a13ed96fa1,2026-08-14T05:33:35.556379,168,"region_temperature_C,THI,heart_rate_bpm,Standing,Walking,Eating,Ruminating,neck_temperature_C,hour_sin,hour_cos,day_sin,day_cos,predicted_body_temp_C"
