@@ -1,0 +1,8 @@
+venv/
+__pycache__/
+*.pyc
+.git/
+.gitignore
+data/hourly_base/*.csv
+*.md
+.env
