@@ -152,9 +152,17 @@ def resample_to_hourly(df: pd.DataFrame, days: int = 7) -> pd.DataFrame:
     # Numeric: time-aware linear interpolation for internal gaps, then
     # edge-fill (ffill/bfill) for any leading/trailing gaps interpolation
     # can't reach.
-    if present_numeric:
-        hourly[present_numeric] = (
-            hourly[present_numeric]
+    # NOTE: region_temp is deliberately EXCLUDED here. Priority order for
+    # region_temp is: (1) actual raw hourly reading, (2) weather-API
+    # lookup via that hour's location (handled in weather.py, run right
+    # after this function), (3) only if location is also missing does it
+    # fall back to interpolation/nearest-value -- that fallback pass runs
+    # in weather.py too, after the API lookup, so it only touches rows
+    # the API genuinely couldn't help.
+    interpolate_cols = [c for c in present_numeric if c != "region_temp"]
+    if interpolate_cols:
+        hourly[interpolate_cols] = (
+            hourly[interpolate_cols]
             .interpolate(method="linear", limit_direction="both")
             .ffill()
             .bfill()

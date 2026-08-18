@@ -1,11 +1,23 @@
 """
 weather.py
 ----------
-Enriches the clean hourly dataset with humidity, pulled from a weather API
+Enriches the clean hourly dataset with humidity AND fills any missing
+region_temp (ambient temperature) values, both pulled from a weather API
 using each row's location + timestamp.
 
 Uses Open-Meteo's free historical/archive endpoint (no API key required):
 https://archive-api.open-meteo.com/v1/archive
+
+region_temp fill priority (region_temp itself is left NaN by processing.py
+whenever an hour had no raw ambient-temp reading, specifically so this
+module can fill it in this order):
+  1. Actual raw reading for that hour (already handled upstream --
+     region_temp is only NaN here if there was none).
+  2. Weather-API lookup using that hour's location, IF a location is
+     present for that hour.
+  3. If location is also missing for that hour, fall back to the
+     nearest available region_temp value in the same week (interpolate,
+     then edge-fill) -- there's nothing else to go on.
 
 Production notes:
 - We batch by (rounded lat/lon, date) instead of calling the API once per
@@ -15,9 +27,9 @@ Production notes:
   roughly (# distinct days) x (# distinct locations) calls.
 - Coordinates are rounded to ~1km precision before grouping, since GPS
   jitter of a few meters shouldn't trigger a fresh API call.
-- Any failed call degrades gracefully (humidity=NaN for that block) rather
-  than crashing the whole pipeline -- one bad network call shouldn't lose
-  a week of health data.
+- Any failed call degrades gracefully (NaN for that block) rather than
+  crashing the whole pipeline -- one bad network call shouldn't lose a
+  week of health data.
 """
 
 import time
@@ -34,17 +46,18 @@ def _round_coord(x, precision=2):
     return round(x, precision)
 
 
-def fetch_humidity_for_group(lat: float, lon: float, date: str, retries: int = 2) -> pd.DataFrame:
+def fetch_weather_for_group(lat: float, lon: float, date: str, retries: int = 2) -> pd.DataFrame:
     """
-    Fetch hourly relative humidity for one lat/lon on one calendar date.
-    Returns a DataFrame with columns [datetime, humidity].
+    Fetch hourly relative humidity AND temperature for one lat/lon on one
+    calendar date, in a single API call. Returns a DataFrame with columns
+    [datetime, humidity, api_temp_c].
     """
     params = {
         "latitude": lat,
         "longitude": lon,
         "start_date": date,
         "end_date": date,
-        "hourly": "relative_humidity_2m",
+        "hourly": "relative_humidity_2m,temperature_2m",
         "timezone": "UTC",
     }
     last_err = None
@@ -56,26 +69,36 @@ def fetch_humidity_for_group(lat: float, lon: float, date: str, retries: int = 2
             hourly = data.get("hourly", {})
             times = hourly.get("time", [])
             humidity = hourly.get("relative_humidity_2m", [])
+            temp = hourly.get("temperature_2m", [])
             return pd.DataFrame({
                 "datetime": pd.to_datetime(times),
                 "humidity": humidity,
+                "api_temp_c": temp,
             })
         except Exception as e:  # noqa: BLE001 - want graceful degradation, not a crash
             last_err = e
             time.sleep(0.5 * (attempt + 1))
-    print(f"[weather] failed to fetch humidity for ({lat},{lon}) on {date}: {last_err}")
-    return pd.DataFrame({"datetime": [], "humidity": []})
+    print(f"[weather] failed to fetch weather for ({lat},{lon}) on {date}: {last_err}")
+    return pd.DataFrame({"datetime": [], "humidity": [], "api_temp_c": []})
 
 
 def add_humidity(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Adds a 'humidity' column to the hourly dataframe by grouping rows into
-    (rounded lat, rounded lon, date) buckets and making one API call per
-    bucket instead of per row.
+    Adds 'humidity' to the hourly dataframe, and fills any NaN region_temp
+    values, by grouping rows into (rounded lat, rounded lon, date) buckets
+    and making one API call per bucket instead of per row.
+
+    region_temp fill priority is enforced here: rows with a location get
+    the weather-API temperature; rows with no location at all are left
+    for the final interpolate/ffill/bfill fallback pass at the end.
     """
     df = df.copy()
     if not {"lat", "lon"}.issubset(df.columns):
         df["humidity"] = np.nan
+        # No location data anywhere -- region_temp can only fall back to
+        # nearest-value within the week.
+        if "region_temp" in df.columns:
+            df["region_temp"] = df["region_temp"].interpolate(limit_direction="both").ffill().bfill()
         return df
 
     df["_lat_r"] = df["lat"].apply(lambda v: _round_coord(v) if pd.notna(v) else np.nan)
@@ -87,17 +110,25 @@ def add_humidity(df: pd.DataFrame) -> pd.DataFrame:
 
     for (lat_r, lon_r, date), group_idx in groups.groups.items():
         rows = df.loc[group_idx]
-        humidity_df = fetch_humidity_for_group(lat_r, lon_r, date)
-        if humidity_df.empty:
+        weather_df = fetch_weather_for_group(lat_r, lon_r, date)
+        if weather_df.empty:
             continue
         merged = pd.merge_asof(
             rows[["datetime"]].sort_values("datetime"),
-            humidity_df.sort_values("datetime"),
+            weather_df.sort_values("datetime"),
             on="datetime",
             direction="nearest",
             tolerance=pd.Timedelta("1h"),
         )
         df.loc[rows.index, "humidity"] = merged["humidity"].values
+
+        # Fill region_temp ONLY where it's currently missing -- never
+        # overwrite an hour that already has a real sensor reading.
+        if "region_temp" in df.columns:
+            needs_fill = df.loc[rows.index, "region_temp"].isna()
+            fill_idx = rows.index[needs_fill.values]
+            if len(fill_idx):
+                df.loc[fill_idx, "region_temp"] = merged.set_index(rows.index)["api_temp_c"].loc[fill_idx].values
 
     df = df.drop(columns=["_lat_r", "_lon_r", "_date"])
 
@@ -105,5 +136,11 @@ def add_humidity(df: pd.DataFrame) -> pd.DataFrame:
     # fall back to interpolation, same policy as the main cleaning stage.
     if df["humidity"].notna().sum() >= 1:
         df["humidity"] = df["humidity"].interpolate(limit_direction="both").ffill().bfill()
+
+    # Final region_temp fallback: any hour that still has no value at this
+    # point had no location AND no raw reading -- nothing left to try but
+    # the nearest available region_temp elsewhere in the week.
+    if "region_temp" in df.columns and df["region_temp"].isna().any():
+        df["region_temp"] = df["region_temp"].interpolate(limit_direction="both").ffill().bfill()
 
     return df

@@ -20,6 +20,7 @@ feature table:
 """
 
 from processing import ACTIVITY_CATEGORIES
+from geocode import get_indian_state
 import numpy as np
 import pandas as pd
 
@@ -36,6 +37,9 @@ FINAL_COLUMNS = [
     "hour_cos",
     "day_sin",
     "day_cos",
+    # -- appended, existing columns above are untouched --
+    "humidity",
+    "state",
 ]
 
 
@@ -93,8 +97,44 @@ def add_cyclical_time_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def add_state(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Reverse-geocodes each row's location to an Indian state name. Looks
+    up once per distinct (rounded) location -- typically one lookup for
+    the whole week, since an animal's location barely moves.
+
+    Rows with no location for that specific hour (but where OTHER hours
+    in the week do have one) inherit the nearest known state via
+    ffill/bfill -- same fallback treatment region_temp gets in
+    weather.py, since a state doesn't realistically change hour to hour.
+    A row only ends up with state=None if EVERY hour in the week lacked
+    location data, or if the resolved point genuinely isn't in India.
+    """
+    df = df.copy()
+    if not {"lat", "lon"}.issubset(df.columns):
+        df["state"] = None
+        return df
+
+    state = pd.Series([None] * len(df), index=df.index, dtype=object)
+    has_loc = df["lat"].notna() & df["lon"].notna()
+    for (lat_r, lon_r), idx in df[has_loc].groupby(
+        [df.loc[has_loc, "lat"].round(2), df.loc[has_loc, "lon"].round(2)]
+    ).groups.items():
+        row = df.loc[idx[0]]
+        state.loc[idx] = get_indian_state(row["lat"], row["lon"])
+
+    # Fall back to the nearest hour's resolved state for hours that had
+    # no location of their own that hour.
+    if state.notna().any():
+        state = state.ffill().bfill()
+
+    df["state"] = state
+    return df
+
+
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
     df = add_thi(df)
+    df = add_state(df)
     df = one_hot_activity(df)
     df = add_cyclical_time_features(df)
 

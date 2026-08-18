@@ -266,6 +266,7 @@ async def process_week(payload: WeeklyDataRequest):
         "region_temperature_C", "THI", "heart_rate_bpm",
         "Standing", "Walking", "Eating", "Ruminating",
         "neck_temperature_C", "predicted_body_temp_C",
+        "humidity", "state",
     ]
     result_df = result_df[WEEK_DATA_COLUMNS]
 
