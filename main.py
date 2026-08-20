@@ -51,11 +51,11 @@ FastAPI service exposing ONE endpoint:
            that last row.
 
            The response has two parts:
-             - "week_data": the 168-row hourly history (the 8 raw
-               sensor/activity columns + predicted_body_temp_C, plus
-               plain date/time) -- this is DESCRIPTIVE, not a
-               prediction, so it does not repeat the estrus outputs on
-               every row.
+             - "daily_summary": one row per day (7 rows) -- daily max/pct
+               rollup of the hourly data (see daily_summary.py). This is
+               DESCRIPTIVE, not a prediction, so it does not repeat the
+               estrus outputs on every row. The full 168-row hourly table
+               is NOT part of the response -- only this daily rollup.
              - "prediction": the single days-to-estrus / date /
                probability result for the week.
            The 30 model2 engineered features and the hour_sin/hour_cos/
@@ -68,30 +68,23 @@ FastAPI service exposing ONE endpoint:
 
     - Response shape:
         {
-          "week_data": {
-            "rows": 168,
-            "columns": [
-              "date", "time", "region_temperature_C", "THI",
-              "heart_rate_bpm", "Standing", "Walking", "Eating",
-              "Ruminating", "neck_temperature_C", "predicted_body_temp_C"
-            ],
-            "data": [
-              {
-                "date": "2026-08-06",
-                "time": "00:00:00",
-                "region_temperature_C": 16.1,
-                "THI": 60.01805,
-                "heart_rate_bpm": 83.5,
-                "Standing": false,
-                "Walking": false,
-                "Eating": false,
-                "Ruminating": true,
-                "neck_temperature_C": 33.345,
-                "predicted_body_temp_C": 39.20598602294922
-              },
-              ... (168 rows total)
-            ]
-          },
+          "daily_summary": [
+            {
+              "date": "2026-08-06",
+              "time": null,
+              "max_region_temperature_C": 30.0,
+              "max_THI": 84.02,
+              "max_heart_rate_bpm": 90.0,
+              "standing_pct": 12.5,
+              "walking_pct": 12.5,
+              "eating_pct": 37.5,
+              "ruminating_pct": 37.5,
+              "max_neck_temperature_C": 35.48,
+              "max_predicted_body_temp_C": 39.62,
+              "max_humidity": 97.0
+            },
+            ... (7 objects total, one per day)
+          ],
           "prediction": {
             "as_of_date": "2026-08-12",
             "as_of_time": "23:00:00",
@@ -122,6 +115,7 @@ from model1_features import build_model1_features
 from model1_predict import predict_body_temp
 from model2_features import build_model2_features
 from estrus_predict import predict_days_to_estrus, predict_estrus_probability_24h
+from daily_summary import build_daily_summary
 
 app = FastAPI(title="Wearable Weekly Data Pipeline")
 
@@ -270,21 +264,19 @@ async def process_week(payload: WeeklyDataRequest):
     ]
     result_df = result_df[WEEK_DATA_COLUMNS]
 
-    # predicted_body_temp_C never contains NaN, but keep this NaN->None
-    # safety pass anyway in case a future raw input column ever does
-    # (JSON has no NaN literal, only null).
-    result_df = result_df.astype(object).where(pd.notnull(result_df), None)
+    # Daily rollup (7 rows, one per day) -- computed from the still-numeric
+    # result_df (aggregation functions like .max()/.sum() need real
+    # numeric dtypes, not object/None).
+    daily_df = build_daily_summary(result_df)
+    daily_records = daily_df.astype(object).where(pd.notnull(daily_df), None).to_dict(orient="records")
 
-    # After this response is sent, base_12col / model1_feats / predictions /
-    # model2_feats are all garbage-collected -- nothing about this request
-    # is retained.
-    records = result_df.to_dict(orient="records")
+    # Only daily_summary + prediction are returned -- the 168-row hourly
+    # week_data table is no longer part of the response (per instructions).
+    # result_df itself is still used above to compute daily_df, but the
+    # hourly-row dict/NaN-safety pass that used to feed "week_data" has
+    # been removed since nothing downstream needs it anymore.
     return JSONResponse({
-        "week_data": {
-            "rows": len(records),
-            "columns": list(result_df.columns),
-            "data": records,
-        },
+        "daily_summary": daily_records,
         "prediction": {
             "as_of_date": last_timestamp.strftime("%Y-%m-%d"),
             "as_of_time": last_timestamp.strftime("%H:%M:%S"),

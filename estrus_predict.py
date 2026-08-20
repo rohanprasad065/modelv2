@@ -45,15 +45,37 @@ window) is left as NaN and handled by XGBoost's native missing-value
 routing (DMatrix's default missing=NaN), not filled with a guessed
 constant.
 
-CAVEAT (read before trusting predictions in production): the reference
-training pipeline for estrus_xgb_model.json also saved
-estrus_imputer.pkl and estrus_scaler.pkl. If those were applied to the
-features before training, this module is NOT reproducing that
-preprocessing -- we don't have those artifacts. If predictions look
-off, that mismatch is the first thing to check.
+FIXED 2026-08-20 (two bugs):
+  1. RAW_43_COLUMNS had predicted_body_temp_C in the wrong position
+     (end of the raw block instead of position 2, right after THI).
+     Since this booster has no feature_names saved, it trusts pure
+     column position -- the old order silently shifted every raw
+     column from position 2 through 12 by one slot.
+  2. The reference training pipeline for estrus_xgb_model.json fit a
+     SimpleImputer + StandardScaler before training, but those objects
+     were never saved -- only model.save_model(...) was called. This
+     module previously fed raw, unscaled values straight into the
+     model. estrus_imputer.pkl / estrus_scaler.pkl / estrus_feature_cols.pkl
+     were reconstructed afterward (see
+     generate_regressor_preprocessing_artifacts.py) by deterministically
+     re-running the same fitting steps against the same training CSV --
+     run that script once before starting this service if those files
+     don't already exist in models/.
+
+REMAINING KNOWN LIMITATION (not fixed by the above, requires retraining
+to fully resolve): the 30 model2 engineered features are rolling/lag/
+z-score computations. At training time they were computed as one
+continuous series across each animal's full multi-thousand-hour
+history; at inference time (this module, fed from main.py) they're
+computed from a single isolated, memoryless 168-hour window. That's a
+real difference in what the feature values represent, not just a code
+bug -- it isn't something a preprocessing fix can correct, and it's the
+likely cause of predictions being less reliable than the model's own
+training-time metrics would suggest, particularly at longer horizons.
 """
 
 import os
+import joblib
 import numpy as np
 import xgboost as xgb
 import pandas as pd
@@ -61,14 +83,25 @@ import pandas as pd
 MODELS_DIR = os.path.join(os.path.dirname(__file__), "models")
 DAYS_MODEL_PATH = os.path.join(MODELS_DIR, "estrus_xgb_model.json")
 CLASSIFIER_MODEL_PATH = os.path.join(MODELS_DIR, "estrus_24hour_xgb_model_phase1.json")
+DAYS_IMPUTER_PATH = os.path.join(MODELS_DIR, "estrus_imputer.pkl")
+DAYS_SCALER_PATH = os.path.join(MODELS_DIR, "estrus_scaler.pkl")
+DAYS_FEATURE_COLS_PATH = os.path.join(MODELS_DIR, "estrus_feature_cols.pkl")
 
-# Exact order the days-to-estrus model was trained on. This booster has
-# no feature_names saved, so position is the ONLY contract -- do not
-# reorder this list without re-checking against the model file.
+# FIXED 2026-08-20: this list previously had predicted_body_temp_C at the
+# end (position 12) instead of position 2. This booster has no
+# feature_names saved, so it trusts pure column position -- the old order
+# silently fed heart_rate_bpm into the slot the model was trained to read
+# as body temperature, and shifted every raw column from position 2
+# through 12 by one slot. Verified against the actual training CSV's
+# natural column order (see generate_regressor_preprocessing_artifacts.py,
+# which derives this same order programmatically from that file --
+# feature_cols = [c for c in df.columns if c != 'days_to_estrus']).
+# Do not reorder this list without re-checking against that script's
+# printed order.
 RAW_43_COLUMNS = [
-    "region_temperature_C", "THI", "heart_rate_bpm", "Standing", "Walking",
-    "Eating", "Ruminating", "neck_temperature_C", "hour_sin", "hour_cos",
-    "day_sin", "day_cos", "predicted_body_temp_C",
+    "region_temperature_C", "THI", "predicted_body_temp_C", "heart_rate_bpm",
+    "Standing", "Walking", "Eating", "Ruminating", "neck_temperature_C",
+    "hour_sin", "hour_cos", "day_sin", "day_cos",
     "body_temp_zscore_24h", "body_temp_zscore_6h", "body_temp_delta_6h",
     "neck_temp_zscore_24h", "thermal_gradient_body_neck",
     "thi_adjusted_body_temp_residual", "cardiothermal_index",
@@ -87,6 +120,9 @@ RAW_43_COLUMNS = [
 
 _days_booster = None
 _classifier_booster = None
+_days_imputer = None
+_days_scaler = None
+_days_feature_cols = None
 
 
 def _load(path: str) -> xgb.Booster:
@@ -112,6 +148,36 @@ def get_days_model() -> xgb.Booster:
     return _days_booster
 
 
+def _get_days_preprocessing():
+    """
+    Loads the imputer/scaler/feature-order the days-to-estrus regressor
+    was trained on. These were never saved during the original Colab
+    training run -- only the model itself was. They were reconstructed
+    afterward (see generate_regressor_preprocessing_artifacts.py) by
+    deterministically re-running the same imputer/scaler-fitting steps
+    against the same training CSV and the same train-slice split logic
+    the original script used, which produces mathematically identical
+    fitted values (spot-checked by hand against sklearn's own output).
+    """
+    global _days_imputer, _days_scaler, _days_feature_cols
+    if _days_imputer is None or _days_scaler is None or _days_feature_cols is None:
+        for path, label in [
+            (DAYS_IMPUTER_PATH, "estrus_imputer.pkl"),
+            (DAYS_SCALER_PATH, "estrus_scaler.pkl"),
+            (DAYS_FEATURE_COLS_PATH, "estrus_feature_cols.pkl"),
+        ]:
+            if not os.path.exists(path):
+                raise FileNotFoundError(
+                    f"{label} not found at {path}. Run "
+                    "generate_regressor_preprocessing_artifacts.py once to "
+                    "create it before starting the service."
+                )
+        _days_imputer = joblib.load(DAYS_IMPUTER_PATH)
+        _days_scaler = joblib.load(DAYS_SCALER_PATH)
+        _days_feature_cols = joblib.load(DAYS_FEATURE_COLS_PATH)
+    return _days_imputer, _days_scaler, _days_feature_cols
+
+
 def get_classifier_model() -> xgb.Booster:
     global _classifier_booster
     if _classifier_booster is None:
@@ -131,17 +197,63 @@ def predict_days_to_estrus(features_df: pd.DataFrame) -> pd.Series:
     order in features_df doesn't matter -- we select+reorder here -- but
     the underlying booster has no name metadata, so RAW_43_COLUMNS above
     must itself be correct and in the model's true training order.
+
+    FIXED 2026-08-20: previously this sent raw, unscaled physical-unit
+    values straight into the DMatrix. The model was trained on
+    median-imputed + StandardScaler-scaled features (its split thresholds
+    live in standardized space), so this step was silently missing.
+    Now applies the reconstructed imputer -> scaler (see
+    _get_days_preprocessing) before prediction, same as the original
+    training pipeline did.
+
     Returns a pandas Series of predicted days_to_estrus, one per row.
     """
     missing = [c for c in RAW_43_COLUMNS if c not in features_df.columns]
     if missing:
         raise ValueError(f"predict_days_to_estrus: missing required columns: {missing}")
 
+    imputer, scaler, feature_cols = _get_days_preprocessing()
+
+    # feature_cols (loaded from estrus_feature_cols.pkl) is the exact
+    # order the imputer/scaler were fit on. It must match RAW_43_COLUMNS
+    # position-for-position, with ONE deliberate exception: position 2 is
+    # "body_temperature_C" in feature_cols (the real sensor column name
+    # used at training time) but "predicted_body_temp_C" in
+    # RAW_43_COLUMNS (there's no live sensor at inference, so Model 1's
+    # prediction fills that slot -- same substitution already used for
+    # the classifier). Any OTHER mismatch means the two have drifted out
+    # of sync and predictions would silently be wrong again.
+    for i, (a, b) in enumerate(zip(RAW_43_COLUMNS, feature_cols)):
+        if a == b:
+            continue
+        if i == 2 and a == "predicted_body_temp_C" and b == "body_temperature_C":
+            continue  # expected, deliberate substitution
+        raise ValueError(
+            f"predict_days_to_estrus: RAW_43_COLUMNS position {i} "
+            f"('{a}') doesn't match estrus_feature_cols.pkl ('{b}'). "
+            "Re-run generate_regressor_preprocessing_artifacts.py or fix "
+            "RAW_43_COLUMNS -- they must stay in sync."
+        )
+
     ordered = features_df[RAW_43_COLUMNS].astype(float)
-    dmatrix = xgb.DMatrix(ordered, missing=np.nan)
+    ordered = ordered.replace([np.inf, -np.inf], np.nan)
+
+    # .values (not the DataFrame) is passed to imputer/scaler on purpose:
+    # they were fit on column names from estrus_feature_cols.pkl, which
+    # has "body_temperature_C" at position 2 -- but `ordered` here
+    # legitimately has "predicted_body_temp_C" in that same slot (the
+    # deliberate substitution checked above). Passing a DataFrame with
+    # different column names would make sklearn raise a feature-name
+    # mismatch error even though the *position* (what actually matters
+    # for both the scaler and the position-only booster) is correct.
+    imputed = imputer.transform(ordered.values)
+    scaled = scaler.transform(imputed)
+
+    dmatrix = xgb.DMatrix(scaled, missing=np.nan)
 
     booster = get_days_model()
     preds = booster.predict(dmatrix)
+    preds = np.clip(preds, 0, None)  # days can't be negative
     return pd.Series(preds, index=features_df.index, name="predicted_days_to_estrus")
 
 
